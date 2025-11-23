@@ -3,6 +3,7 @@ from scipy.stats import norm
 from scipy.optimize import OptimizeResult
 from scipy.interpolate import interp1d
 from typing import List, Optional, Tuple, Union
+from abc import ABC, abstractmethod
 import numpy as np
 import pandas as pd
 
@@ -19,16 +20,47 @@ def forward_bs_price(S: Union[float, np.ndarray], K: Union[float, np.ndarray], T
     return np.where(is_call, call_price, put_price)
 
 
-class SSVIModel:
+class AbstractSSVIModel(ABC):
     def __init__(self, lr: float = 1e-3, outside_spread_penalty: float = 0.0, temporal_interp_method: str = 'linear') -> None:
-        self.rho: Optional[float] = None
         self.eta: Optional[float] = None
         self.gamma: Optional[float] = None
         self.theta_t: Optional[np.ndarray] = None
         self.T_fitted: Optional[np.ndarray] = None
+        self.r_fitted: Optional[float] = None
+        self.q_fitted: Optional[float] = None
         self.lr = lr
         self.outside_spread_penalty = outside_spread_penalty
         self.temporal_interp_method = temporal_interp_method
+    
+    @abstractmethod
+    def _unpack_params(self, params: np.ndarray, T_array: np.ndarray, r: Optional[float], q: Optional[float]) -> Tuple[Union[float, np.ndarray], float, float, np.ndarray, float, float]:
+        """Unpack parameters from optimization array. Returns (rho, eta, gamma, theta_t, r_val, q_val)."""
+        pass
+    
+    @abstractmethod
+    def _get_rho_for_idx(self, rho_unpacked: Union[float, np.ndarray], idx: int) -> float:
+        """Get rho value for a specific maturity index."""
+        pass
+    
+    @abstractmethod
+    def _estimate_initial_params(self, T_array: np.ndarray, strikes_list: List[np.ndarray], bids_list: List[np.ndarray], asks_list: List[np.ndarray], option_types_list: List[np.ndarray], S0: float, r: Optional[float], q: Optional[float]) -> np.ndarray:
+        """Estimate initial parameters."""
+        pass
+    
+    @abstractmethod
+    def _get_bounds(self, n_maturities: int, r: Optional[float], q: Optional[float]) -> List[Tuple[float, float]]:
+        """Get parameter bounds for optimization."""
+        pass
+    
+    @abstractmethod
+    def _get_monotonicity_constraint(self, n_maturities: int):
+        """Get monotonicity constraint function."""
+        pass
+    
+    @abstractmethod
+    def _store_fitted_params(self, result: OptimizeResult, T_array: np.ndarray, n_maturities: int, r: Optional[float], q: Optional[float]) -> None:
+        """Store fitted parameters from optimization result."""
+        pass
     
     def theta_interp(self, T: Union[float, np.ndarray]) -> np.ndarray:
         """Interpolation of θ_t for arbitrary T."""
@@ -41,17 +73,29 @@ class SSVIModel:
     
     def predict(self, k: Union[float, np.ndarray], t: Union[float, np.ndarray]) -> np.ndarray:
         """Predict implied volatility for given log-moneyness k and time to expiry t."""
-        if self.rho is None or self.eta is None or self.gamma is None:
+        if not self._is_fitted():
             raise ValueError("Model not fitted yet")
         theta_t = self.theta_interp(t)
-        w = self.ssvi(k, self.rho, self.eta, self.gamma, theta_t)
+        rho = self._get_rho_for_prediction(t)
+        w = self.ssvi(k, rho, self.eta, self.gamma, theta_t)
         t = np.asarray(t)
         return np.sqrt(np.maximum(w / t, 1e-8))
     
-    def ssvi(self, k: Union[float, np.ndarray], rho: float, eta: float, gamma: float, theta_t: Union[float, np.ndarray]) -> np.ndarray:
+    @abstractmethod
+    def _is_fitted(self) -> bool:
+        """Check if model is fitted."""
+        pass
+    
+    @abstractmethod
+    def _get_rho_for_prediction(self, t: Union[float, np.ndarray]) -> Union[float, np.ndarray]:
+        """Get rho value(s) for prediction at time(s) t."""
+        pass
+    
+    def ssvi(self, k: Union[float, np.ndarray], rho: Union[float, np.ndarray], eta: float, gamma: float, theta_t: Union[float, np.ndarray]) -> np.ndarray:
         """Canonical SSVI: w(k,t) = (θ_t/2)[1 + ρ*φ(θ_t)*k + sqrt((φ(θ_t)*k + ρ)² + 1 - ρ²)]."""
         k = np.asarray(k)
         theta_t = np.asarray(theta_t)
+        rho = np.asarray(rho)
         phi = eta * (theta_t ** (-gamma))
         phi_k = phi * k
         sqrt_term = np.sqrt((phi_k + rho)**2 + 1 - rho**2)
@@ -105,12 +149,8 @@ class SSVIModel:
         return residuals, weights
     
     def objective(self, params: np.ndarray, T_array: np.ndarray, strikes_list: List[np.ndarray], bids_list: List[np.ndarray], asks_list: List[np.ndarray], option_types_list: List[np.ndarray], S0: float, r: Optional[float], q: Optional[float]) -> float:
-        """Weighted least squares: params = [rho, eta, gamma, theta_t0, theta_t1, ..., r?, q?]."""
-        rho, eta, gamma = params[0], params[1], params[2]
-        n_theta = len(T_array)
-        theta_t = params[3:3+n_theta]
-        r_val = params[-2] if (r is None and q is None) else (params[-1] if r is None else r)
-        q_val = params[-1] if q is None else q
+        """Weighted least squares objective function."""
+        rho, eta, gamma, theta_t, r_val, q_val = self._unpack_params(params, T_array, r, q)
         total_loss = 0.0
         n_processed = 0
         
@@ -123,7 +163,8 @@ class SSVIModel:
             bid_filled, ask_filled = self._fill_spreads(k, bids, asks)
             spreads = ask_filled - bid_filled
             
-            w_model = self.ssvi(k, rho, eta, gamma, theta_t[idx])
+            rho_idx = self._get_rho_for_idx(rho, idx)
+            w_model = self.ssvi(k, rho_idx, eta, gamma, theta_t[idx])
             iv_model = np.sqrt(np.maximum(w_model / T, 1e-8))
             model_prices = forward_bs_price(S0, strikes, T, iv_model, r_val, q_val, option_types == 'call')
 
@@ -141,33 +182,8 @@ class SSVIModel:
         
         return total_loss / n_processed if n_processed > 0 else 0.0
     
-    def _estimate_initial_params(self, T_array: np.ndarray, strikes_list: List[np.ndarray], bids_list: List[np.ndarray], asks_list: List[np.ndarray], option_types_list: List[np.ndarray], S0: float, r: Optional[float], q: Optional[float]) -> np.ndarray:
-        """Estimate initial parameters: [rho, eta, gamma] + theta_t per maturity + r?, q?."""
-        r_init = r if r is not None else 0.025
-        q_init = q if q is not None else 0.0
-        theta_t_init = []
-        for T, strikes, bids, asks in zip(T_array, strikes_list, bids_list, asks_list):
-            F_T = S0 * np.exp((r_init - q_init) * T)
-            k = np.log(strikes / F_T)
-            both_valid = ~(np.isnan(bids) | np.isnan(asks))
-            
-            if np.any(both_valid):
-                atm_idx = np.where(both_valid)[0][np.argmin(np.abs(k[both_valid]))]
-                mid_price = (bids[atm_idx] + asks[atm_idx]) / 2.0
-                theta_t_init.append(0.64 * T if mid_price >= 1e-6 else 0.1 * T)
-            else:
-                theta_t_init.append(0.1 * T)
-        
-        base_params = np.concatenate([[-0.3, 1.0, 0.5], theta_t_init])
-        extra_params = []
-        if r is None:
-            extra_params.append(r_init)
-        if q is None:
-            extra_params.append(q_init)
-        return np.concatenate([base_params, extra_params]) if extra_params else base_params
-    
     def fit(self, T_array: Union[np.ndarray, List[float]], strikes_list: List[np.ndarray], bids_list: List[np.ndarray], asks_list: List[np.ndarray], option_types_list: List[np.ndarray], S0: float, r: Optional[float], q: Optional[float], initial_params: Optional[np.ndarray] = None) -> OptimizeResult:
-        """Fit canonical SSVI: fixed [rho, eta, gamma] + theta_t array + optional r, q."""
+        """Fit SSVI model."""
         T_array = np.asarray(T_array)
         sort_idx = np.argsort(T_array)
         T_array = T_array[sort_idx]
@@ -180,28 +196,19 @@ class SSVIModel:
         if initial_params is None:
             initial_params = self._estimate_initial_params(T_array, strikes_list, bids_list, asks_list, option_types_list, S0, r, q)
         else:
-            initial_params = np.concatenate([initial_params[:3], initial_params[3:3+n_maturities][sort_idx]])
-            extra_params = []
-            if r is None:
-                extra_params.append(0.025)
-            if q is None:
-                extra_params.append(0.0)
-            if extra_params:
-                initial_params = np.concatenate([initial_params, extra_params])
+            initial_params = self._process_initial_params(initial_params, T_array, n_maturities, sort_idx, r, q)
         
         def arb_constraint(params: np.ndarray) -> float:
-            rho, eta = params[0], params[1]
-            return 4 - eta * (1 + np.abs(rho))
+            rho_unpacked, eta, gamma, _, _, _ = self._unpack_params(params, T_array, r, q)
+            if isinstance(rho_unpacked, (int, float)):
+                rho_max_abs = np.abs(rho_unpacked)
+            else:
+                rho_max_abs = np.max(np.abs(rho_unpacked))
+            return 4 - eta * (1 + rho_max_abs)
         
-        def monotonicity_constraint(params: np.ndarray) -> np.ndarray:
-            theta_t = params[3:3+n_maturities]
-            return np.diff(theta_t) if len(theta_t) > 1 else np.array([0.0])
+        monotonicity_constraint = self._get_monotonicity_constraint(n_maturities)
         
-        bounds = [(-0.9, 0.9), (1e-3, 3.0), (1e-4, 0.99)] + [(1e-5, 10.0)] * n_maturities
-        if r is None:
-            bounds.append((-0.1, 0.1))
-        if q is None:
-            bounds.append((-0.1, 0.1))
+        bounds = self._get_bounds(n_maturities, r, q)
         
         result = minimize(
             self.objective,
@@ -216,12 +223,56 @@ class SSVIModel:
         if not result.success:
             print(f"Warning: Optimization did not converge. Message: {result.message}")
         
-        self.rho, self.eta, self.gamma = result.x[0], result.x[1], result.x[2]
-        self.theta_t = result.x[3:3+n_maturities]
-        self.r_fitted = result.x[-2] if (r is None and q is None) else (result.x[-1] if r is None else r)
-        self.q_fitted = result.x[-1] if q is None else q
-        self.T_fitted = T_array.copy()
+        self._store_fitted_params(result, T_array, n_maturities, r, q)
         return result
+    
+    @abstractmethod
+    def _process_initial_params(self, initial_params: np.ndarray, T_array: np.ndarray, n_maturities: int, sort_idx: np.ndarray, r: Optional[float], q: Optional[float]) -> np.ndarray:
+        """Process initial parameters for optimization."""
+        pass
+    
+    def _extract_r_q_from_params(self, params: np.ndarray, r: Optional[float], q: Optional[float]) -> Tuple[float, float]:
+        """Extract r and q values from params array."""
+        if r is None and q is None:
+            return params[-2], params[-1]
+        elif r is None:
+            return params[-1], q
+        elif q is None:
+            return r, params[-1]
+        else:
+            return r, q
+    
+    def _append_r_q_to_params(self, base_params: np.ndarray, r: Optional[float], q: Optional[float]) -> np.ndarray:
+        """Append r and q values to params array if needed."""
+        if r is None:
+            base_params = np.append(base_params, 0.025)
+        if q is None:
+            base_params = np.append(base_params, 0.0)
+        return base_params
+    
+    def _append_r_q_bounds(self, bounds: List[Tuple[float, float]], r: Optional[float], q: Optional[float]) -> List[Tuple[float, float]]:
+        """Append r and q bounds to bounds list if needed."""
+        if r is None:
+            bounds.append((-0.1, 0.1))
+        if q is None:
+            bounds.append((-0.1, 0.1))
+        return bounds
+    
+    def _estimate_theta_t_init(self, T_array: np.ndarray, strikes_list: List[np.ndarray], bids_list: List[np.ndarray], asks_list: List[np.ndarray], S0: float, r_init: float, q_init: float) -> List[float]:
+        """Estimate initial theta_t values from market data."""
+        theta_t_init = []
+        for T, strikes, bids, asks in zip(T_array, strikes_list, bids_list, asks_list):
+            F_T = S0 * np.exp((r_init - q_init) * T)
+            k = np.log(strikes / F_T)
+            both_valid = ~(np.isnan(bids) | np.isnan(asks))
+            
+            if np.any(both_valid):
+                atm_idx = np.where(both_valid)[0][np.argmin(np.abs(k[both_valid]))]
+                mid_price = (bids[atm_idx] + asks[atm_idx]) / 2.0
+                theta_t_init.append(0.64 * T if mid_price >= 1e-6 else 0.1 * T)
+            else:
+                theta_t_init.append(0.1 * T)
+        return theta_t_init
     
     def check_bid_ask_crossings(self, option_df: pd.DataFrame, S0: float, r: float, q: float) -> pd.DataFrame:
         """Check if model prices cross outside bid/ask spread, grouped by maturity and contract type.
@@ -239,7 +290,7 @@ class SSVIModel:
         - amount_below_bid: bid - model_price if crosses below, else 0
         - amount_above_ask: model_price - ask if crosses above, else 0
         """
-        if self.rho is None or self.eta is None or self.gamma is None or self.theta_t is None:
+        if not self._is_fitted():
             raise ValueError("Model must be fitted before checking bid/ask crossings")
         
         rows = []
@@ -252,6 +303,7 @@ class SSVIModel:
             
             T = df_exp["T"].iloc[0]
             theta_t_val = self.theta_interp(T)
+            rho_val = self._get_rho_for_prediction(T)
             
             for option_type in ['call', 'put']:
                 df_type = df_exp[df_exp["option_type"] == option_type].sort_values("strike")
@@ -265,7 +317,7 @@ class SSVIModel:
                 # Compute model prices
                 F_T = S0 * np.exp((r - q) * T)
                 k = np.log(strikes / F_T)
-                w_model = self.ssvi(k, self.rho, self.eta, self.gamma, theta_t_val)
+                w_model = self.ssvi(k, rho_val, self.eta, self.gamma, theta_t_val)
                 iv_model = np.sqrt(np.maximum(w_model / T, 1e-8))
                 is_call = (option_type == 'call')
                 model_prices = forward_bs_price(S0, strikes, T, iv_model, r, q, is_call)
@@ -300,3 +352,136 @@ class SSVIModel:
                     })
         
         return pd.DataFrame(rows)
+
+
+class SSVIModel(AbstractSSVIModel):
+    def __init__(self, lr: float = 1e-3, outside_spread_penalty: float = 0.0, temporal_interp_method: str = 'linear') -> None:
+        super().__init__(lr, outside_spread_penalty, temporal_interp_method)
+        self.rho: Optional[float] = None
+    
+    def _is_fitted(self) -> bool:
+        return self.rho is not None and self.eta is not None and self.gamma is not None
+    
+    def _get_rho_for_prediction(self, t: Union[float, np.ndarray]) -> Union[float, np.ndarray]:
+        return self.rho
+    
+    def _unpack_params(self, params: np.ndarray, T_array: np.ndarray, r: Optional[float], q: Optional[float]) -> Tuple[float, float, float, np.ndarray, float, float]:
+        """Unpack parameters: [rho, eta, gamma, theta_t0, theta_t1, ..., r?, q?]."""
+        rho = params[0]
+        eta = params[1]
+        gamma = params[2]
+        n_theta = len(T_array)
+        theta_t = params[3:3+n_theta]
+        r_val, q_val = self._extract_r_q_from_params(params, r, q)
+        return rho, eta, gamma, theta_t, r_val, q_val
+    
+    def _get_rho_for_idx(self, rho_unpacked: Union[float, np.ndarray], idx: int) -> float:
+        return float(rho_unpacked)
+    
+    def _estimate_initial_params(self, T_array: np.ndarray, strikes_list: List[np.ndarray], bids_list: List[np.ndarray], asks_list: List[np.ndarray], option_types_list: List[np.ndarray], S0: float, r: Optional[float], q: Optional[float]) -> np.ndarray:
+        """Estimate initial parameters: [rho, eta, gamma] + theta_t per maturity + r?, q?."""
+        r_init = r if r is not None else 0.025
+        q_init = q if q is not None else 0.0
+        theta_t_init = self._estimate_theta_t_init(T_array, strikes_list, bids_list, asks_list, S0, r_init, q_init)
+        base_params = np.concatenate([[-0.3, 1.0, 0.5], theta_t_init])
+        return self._append_r_q_to_params(base_params, r, q)
+    
+    def _get_bounds(self, n_maturities: int, r: Optional[float], q: Optional[float]) -> List[Tuple[float, float]]:
+        """Get parameter bounds: [rho, eta, gamma] + theta_t per maturity + r?, q?."""
+        bounds = [(-0.9, 0.9), (1e-3, 3.0), (1e-4, 0.99)] + [(1e-5, 10.0)] * n_maturities
+        return self._append_r_q_bounds(bounds, r, q)
+    
+    def _get_monotonicity_constraint(self, n_maturities: int):
+        """Get monotonicity constraint for theta_t."""
+        def monotonicity_constraint(params: np.ndarray) -> np.ndarray:
+            theta_t = params[3:3+n_maturities]
+            return np.diff(theta_t) if len(theta_t) > 1 else np.array([0.0])
+        return monotonicity_constraint
+    
+    def _store_fitted_params(self, result: OptimizeResult, T_array: np.ndarray, n_maturities: int, r: Optional[float], q: Optional[float]) -> None:
+        """Store fitted parameters from optimization result."""
+        self.rho = result.x[0]
+        self.eta = result.x[1]
+        self.gamma = result.x[2]
+        self.theta_t = result.x[3:3+n_maturities]
+        self.r_fitted, self.q_fitted = self._extract_r_q_from_params(result.x, r, q)
+        self.T_fitted = T_array.copy()
+    
+    def _process_initial_params(self, initial_params: np.ndarray, T_array: np.ndarray, n_maturities: int, sort_idx: np.ndarray, r: Optional[float], q: Optional[float]) -> np.ndarray:
+        """Process initial parameters for optimization."""
+        params = np.concatenate([initial_params[:3], initial_params[3:3+n_maturities][sort_idx]])
+        return self._append_r_q_to_params(params, r, q)
+
+
+class eSSVIModel(AbstractSSVIModel):
+    def __init__(self, lr: float = 1e-3, outside_spread_penalty: float = 0.0, temporal_interp_method: str = 'linear') -> None:
+        super().__init__(lr, outside_spread_penalty, temporal_interp_method)
+        self.rho_t: Optional[np.ndarray] = None
+    
+    def _is_fitted(self) -> bool:
+        return self.rho_t is not None and self.eta is not None and self.gamma is not None
+    
+    def rho_interp(self, T: Union[float, np.ndarray]) -> np.ndarray:
+        """Interpolation of ρ_t for arbitrary T."""
+        if self.rho_t is None or self.T_fitted is None:
+            raise ValueError("Model not fitted yet")
+        T = np.asarray(T)
+        interp_func = interp1d(self.T_fitted, self.rho_t, kind=self.temporal_interp_method, 
+                              bounds_error=False, fill_value='extrapolate')
+        return interp_func(T)
+    
+    def _get_rho_for_prediction(self, t: Union[float, np.ndarray]) -> Union[float, np.ndarray]:
+        return self.rho_interp(t)
+    
+    def _unpack_params(self, params: np.ndarray, T_array: np.ndarray, r: Optional[float], q: Optional[float]) -> Tuple[np.ndarray, float, float, np.ndarray, float, float]:
+        """Unpack parameters: [eta, gamma, rho_t0, rho_t1, ..., theta_t0, theta_t1, ..., r?, q?]."""
+        eta = params[0]
+        gamma = params[1]
+        n_rho = len(T_array)
+        rho_t = params[2:2+n_rho]
+        n_theta = len(T_array)
+        theta_t = params[2+n_rho:2+n_rho+n_theta]
+        r_val, q_val = self._extract_r_q_from_params(params, r, q)
+        return rho_t, eta, gamma, theta_t, r_val, q_val
+    
+    def _get_rho_for_idx(self, rho_unpacked: Union[float, np.ndarray], idx: int) -> float:
+        return float(rho_unpacked[idx])
+    
+    def _estimate_initial_params(self, T_array: np.ndarray, strikes_list: List[np.ndarray], bids_list: List[np.ndarray], asks_list: List[np.ndarray], option_types_list: List[np.ndarray], S0: float, r: Optional[float], q: Optional[float]) -> np.ndarray:
+        """Estimate initial parameters: [eta, gamma] + rho_t per maturity + theta_t per maturity + r?, q?."""
+        r_init = r if r is not None else 0.025
+        q_init = q if q is not None else 0.0
+        theta_t_init = self._estimate_theta_t_init(T_array, strikes_list, bids_list, asks_list, S0, r_init, q_init)
+        rho_t_init = [-0.3] * len(T_array)
+        base_params = np.concatenate([[1.0, 0.5], rho_t_init, theta_t_init])
+        return self._append_r_q_to_params(base_params, r, q)
+    
+    def _get_bounds(self, n_maturities: int, r: Optional[float], q: Optional[float]) -> List[Tuple[float, float]]:
+        """Get parameter bounds: [eta, gamma] + rho_t per maturity + theta_t per maturity + r?, q?."""
+        bounds = [(1e-3, 3.0), (1e-4, 0.99)] + [(-0.9, 0.9)] * n_maturities + [(1e-5, 10.0)] * n_maturities
+        return self._append_r_q_bounds(bounds, r, q)
+    
+    def _get_monotonicity_constraint(self, n_maturities: int):
+        """Get monotonicity constraint for theta_t."""
+        def monotonicity_constraint(params: np.ndarray) -> np.ndarray:
+            theta_t = params[2+n_maturities:2+2*n_maturities]
+            return np.diff(theta_t) if len(theta_t) > 1 else np.array([0.0])
+        return monotonicity_constraint
+    
+    def _store_fitted_params(self, result: OptimizeResult, T_array: np.ndarray, n_maturities: int, r: Optional[float], q: Optional[float]) -> None:
+        """Store fitted parameters from optimization result."""
+        self.eta = result.x[0]
+        self.gamma = result.x[1]
+        self.rho_t = result.x[2:2+n_maturities]
+        self.theta_t = result.x[2+n_maturities:2+2*n_maturities]
+        self.r_fitted, self.q_fitted = self._extract_r_q_from_params(result.x, r, q)
+        self.T_fitted = T_array.copy()
+    
+    def _process_initial_params(self, initial_params: np.ndarray, T_array: np.ndarray, n_maturities: int, sort_idx: np.ndarray, r: Optional[float], q: Optional[float]) -> np.ndarray:
+        """Process initial params: [eta, gamma] + rho_t + theta_t + r?, q?."""
+        params = np.concatenate([
+            initial_params[:2],
+            initial_params[2:2+n_maturities][sort_idx],
+            initial_params[2+n_maturities:2+2*n_maturities][sort_idx]
+        ])
+        return self._append_r_q_to_params(params, r, q)

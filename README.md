@@ -60,10 +60,11 @@ The test suite includes property-based tests that verify:
 
 This implementation is based on the SSVI methodology described in:
 
-```
-Gatheral, J., & Jacquier, A. (2014). Arbitrage-free SVI volatility surfaces.
-Quantitative Finance, 14(1), 59-71.
-```
+- Gatheral, J., & Jacquier, A. (2014). Arbitrage-free SVI volatility surfaces. Quantitative Finance, 14(1), 59-71.
+
+- Hendriks, S., & Martini, C. (2017). The Extended SSVI Volatility Surface. Available at SSRN.
+
+  This paper extends the SSVI parameterization by making the correlation maturity-dependent, providing necessary and sufficient conditions for no calendar-spread arbitrage.
 
 ## License
 
