@@ -1,4 +1,4 @@
-from .ssvi_model import SSVIModel, forward_bs_price
+from .ssvi_model import AbstractSSVIModel, SSVIModel, eSSVIModel, forward_bs_price
 
 __version__ = "0.1.0"
-__all__ = ['SSVIModel', 'forward_bs_price']
+__all__ = ['AbstractSSVIModel', 'SSVIModel', 'eSSVIModel', 'forward_bs_price']
