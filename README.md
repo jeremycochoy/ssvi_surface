@@ -24,6 +24,25 @@ iv = model.predict(k, t)
 price = forward_bs_price(S, K, T, iv, r, q, is_call)
 ```
 
+## Running Tests
+
+To run the test suite:
+
+```bash
+# Run all tests
+python -m unittest discover -s tests -p "test_*.py" -v
+
+# Or run a specific test file
+python -m unittest tests.test_ssvi_formula -v
+```
+
+The test suite includes property-based tests that verify:
+- Mathematical properties of the SSVI formula (positivity, continuity, scaling)
+- Theta interpolation accuracy and monotonicity preservation
+- Prediction consistency and correctness
+- Fitting constraints (arbitrage-free, parameter bounds)
+- Integration tests for the full workflow
+
 ## Citation
 
 **If you use this software in published research, please cite this repository:**
