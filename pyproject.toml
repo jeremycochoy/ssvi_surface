@@ -43,8 +43,8 @@ dev = [
     "pytest-cov>=4.0.0",
 ]
 
-[tool.setuptools]
-packages = {find = {}}
+[tool.setuptools.packages.find]
+where = ["."]
 
 [tool.setuptools.package-data]
 "*" = ["*.txt", "*.md"]
