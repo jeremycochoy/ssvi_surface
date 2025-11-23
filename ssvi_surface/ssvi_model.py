@@ -58,6 +58,11 @@ class AbstractSSVIModel(ABC):
         pass
     
     @abstractmethod
+    def _get_lipschitz_constraint(self, n_maturities: int, T_array: np.ndarray, r: Optional[float], q: Optional[float]):
+        """Get Lipschitz constraint function for rho across maturities. Returns None if not applicable."""
+        pass
+    
+    @abstractmethod
     def _store_fitted_params(self, result: OptimizeResult, T_array: np.ndarray, n_maturities: int, r: Optional[float], q: Optional[float]) -> None:
         """Store fitted parameters from optimization result."""
         pass
@@ -207,8 +212,13 @@ class AbstractSSVIModel(ABC):
             return 4 - eta * (1 + rho_max_abs)
         
         monotonicity_constraint = self._get_monotonicity_constraint(n_maturities)
+        lipschitz_constraint = self._get_lipschitz_constraint(n_maturities, T_array, r, q)
         
         bounds = self._get_bounds(n_maturities, r, q)
+        
+        constraints = [{'type': 'ineq', 'fun': arb_constraint}, {'type': 'ineq', 'fun': monotonicity_constraint}]
+        if lipschitz_constraint is not None:
+            constraints.append({'type': 'ineq', 'fun': lipschitz_constraint})
         
         result = minimize(
             self.objective,
@@ -216,7 +226,7 @@ class AbstractSSVIModel(ABC):
             args=(T_array, strikes_list, bids_list, asks_list, option_types_list, S0, r, q),
             method='SLSQP',
             bounds=bounds,
-            constraints=[{'type': 'ineq', 'fun': arb_constraint}, {'type': 'ineq', 'fun': monotonicity_constraint}],
+            constraints=constraints,
             options={'maxiter': 5000, 'ftol': 1e-6, 'eps': 1e-4}
         )
         
@@ -398,6 +408,10 @@ class SSVIModel(AbstractSSVIModel):
             return np.diff(theta_t) if len(theta_t) > 1 else np.array([0.0])
         return monotonicity_constraint
     
+    def _get_lipschitz_constraint(self, n_maturities: int, T_array: np.ndarray, r: Optional[float], q: Optional[float]):
+        """Get Lipschitz constraint function for rho across maturities. Returns None for SSVIModel."""
+        return None
+    
     def _store_fitted_params(self, result: OptimizeResult, T_array: np.ndarray, n_maturities: int, r: Optional[float], q: Optional[float]) -> None:
         """Store fitted parameters from optimization result."""
         self.rho = result.x[0]
@@ -467,6 +481,49 @@ class eSSVIModel(AbstractSSVIModel):
             theta_t = params[2+n_maturities:2+2*n_maturities]
             return np.diff(theta_t) if len(theta_t) > 1 else np.array([0.0])
         return monotonicity_constraint
+    
+    def _get_lipschitz_constraint(self, n_maturities: int, T_array: np.ndarray, r: Optional[float], q: Optional[float]):
+        """Get Lipschitz constraint function for rho across maturities.
+        
+        For each adjacent pair i, i+1 with theta_t[i+1] > theta_t[i]:
+        |rho_t[i+1] - rho_t[i]| ≤ phi(theta_t[i]) * (theta_t[i+1] - theta_t[i]) / theta_t[i]
+        where phi(theta) = eta * (theta^(-gamma))
+        """
+        def lipschitz_constraint(params: np.ndarray) -> np.ndarray:
+            eta = params[0]
+            gamma = params[1]
+            rho_t = params[2:2+n_maturities]
+            theta_t = params[2+n_maturities:2+2*n_maturities]
+            
+            if n_maturities < 2:
+                return np.array([0.0])
+            
+            slacks = []
+            for i in range(n_maturities - 1):
+                theta_i = theta_t[i]
+                theta_j = theta_t[i+1]
+                rho_i = rho_t[i]
+                rho_j = rho_t[i+1]
+                
+                # Only apply constraint if theta is increasing
+                if theta_j > theta_i:
+                    # Compute phi(theta_i) = eta * (theta_i^(-gamma))
+                    phi_i = eta * (theta_i ** (-gamma))
+                    # Maximum allowed step: phi(theta_i) * (theta_j - theta_i) / theta_i
+                    max_step = phi_i * (theta_j - theta_i) / theta_i
+                    # Actual step
+                    actual_step = np.abs(rho_j - rho_i)
+                    # Slack: positive when constraint is satisfied
+                    slack = max_step - actual_step
+                    slacks.append(slack)
+                else:
+                    # If theta is not increasing, this pair is handled by monotonicity constraint
+                    # Set a large slack to effectively skip this constraint
+                    slacks.append(1e6)
+            
+            return np.array(slacks) if slacks else np.array([0.0])
+        
+        return lipschitz_constraint
     
     def _store_fitted_params(self, result: OptimizeResult, T_array: np.ndarray, n_maturities: int, r: Optional[float], q: Optional[float]) -> None:
         """Store fitted parameters from optimization result."""
