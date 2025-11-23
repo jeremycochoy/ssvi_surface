@@ -1,6 +1,6 @@
 import unittest
 import numpy as np
-from ssvi_model import SSVIModel
+from ssvi_surface import SSVIModel
 
 
 class TestNumericalStability(unittest.TestCase):

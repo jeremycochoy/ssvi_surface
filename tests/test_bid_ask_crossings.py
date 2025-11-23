@@ -1,7 +1,7 @@
 import unittest
 import numpy as np
 import pandas as pd
-from ssvi_model import SSVIModel, forward_bs_price
+from ssvi_surface import SSVIModel, forward_bs_price
 
 
 class TestBidAskCrossings(unittest.TestCase):

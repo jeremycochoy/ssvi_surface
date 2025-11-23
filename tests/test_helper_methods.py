@@ -1,7 +1,7 @@
 import unittest
 import numpy as np
 import numpy.testing as npt
-from ssvi_model import SSVIModel
+from ssvi_surface import SSVIModel
 
 
 class TestHelperMethods(unittest.TestCase):
