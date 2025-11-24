@@ -9,6 +9,7 @@ class TestInitialization(unittest.TestCase):
         model = SSVIModel()
         self.assertEqual(model.lr, 1e-3)
         self.assertEqual(model.outside_spread_penalty, 0.0)
+        self.assertEqual(model.maturity_weight_exponent, 1.0)
         self.assertEqual(model.temporal_interp_method, 'linear')
         self.assertIsNone(model.rho)
         self.assertIsNone(model.eta)
@@ -21,10 +22,12 @@ class TestInitialization(unittest.TestCase):
         model = SSVIModel(
             lr=0.001,
             outside_spread_penalty=2.0,
+            maturity_weight_exponent=0.5,
             temporal_interp_method='cubic'
         )
         self.assertEqual(model.lr, 0.001)
         self.assertEqual(model.outside_spread_penalty, 2.0)
+        self.assertEqual(model.maturity_weight_exponent, 0.5)
         self.assertEqual(model.temporal_interp_method, 'cubic')
         self.assertIsNone(model.rho)
         self.assertIsNone(model.eta)

@@ -20,7 +20,7 @@ def forward_bs_price(S: Union[float, np.ndarray], K: Union[float, np.ndarray], T
 
 
 class SSVIModel:
-    def __init__(self, lr: float = 1e-3, outside_spread_penalty: float = 0.0, temporal_interp_method: str = 'linear') -> None:
+    def __init__(self, lr: float = 1e-3, outside_spread_penalty: float = 0.0, maturity_weight_exponent: float = 1.0, temporal_interp_method: str = 'linear') -> None:
         self.rho: Optional[float] = None
         self.eta: Optional[float] = None
         self.gamma: Optional[float] = None
@@ -28,6 +28,7 @@ class SSVIModel:
         self.T_fitted: Optional[np.ndarray] = None
         self.lr = lr
         self.outside_spread_penalty = outside_spread_penalty
+        self.maturity_weight_exponent = maturity_weight_exponent
         self.temporal_interp_method = temporal_interp_method
     
     def theta_interp(self, T: Union[float, np.ndarray]) -> np.ndarray:
@@ -111,8 +112,8 @@ class SSVIModel:
         theta_t = params[3:3+n_theta]
         r_val = params[-2] if (r is None and q is None) else (params[-1] if r is None else r)
         q_val = params[-1] if q is None else q
-        total_loss = 0.0
-        n_processed = 0
+        total_weighted_loss = 0.0
+        sum_weights = 0.0
         
         for idx, (T, strikes, bids, asks, option_types) in enumerate(zip(T_array, strikes_list, bids_list, asks_list, option_types_list)):
             if not (np.any(~np.isnan(bids)) or np.any(~np.isnan(asks))):
@@ -136,10 +137,11 @@ class SSVIModel:
             ask_penalty = np.sum(np.maximum(0, ask_residuals) * ask_weights) / np.sum(ask_weights)
             
             loss = bid_loss + ask_loss + self.outside_spread_penalty * (bid_penalty + ask_penalty)
-            total_loss += self.lr * loss
-            n_processed += 1
+            weight = T ** self.maturity_weight_exponent
+            total_weighted_loss += self.lr * loss * weight
+            sum_weights += weight
         
-        return total_loss / n_processed if n_processed > 0 else 0.0
+        return total_weighted_loss / sum_weights if sum_weights > 0 else 0.0
     
     def _estimate_initial_params(self, T_array: np.ndarray, strikes_list: List[np.ndarray], bids_list: List[np.ndarray], asks_list: List[np.ndarray], option_types_list: List[np.ndarray], S0: float, r: Optional[float], q: Optional[float]) -> np.ndarray:
         """Estimate initial parameters: [rho, eta, gamma] + theta_t per maturity + r?, q?."""
