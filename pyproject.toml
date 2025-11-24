@@ -9,13 +9,14 @@ description = "SSVI (Stochastic Volatility Inspired) model for implied volatilit
 readme = "README.md"
 requires-python = ">=3.8"
 license = {text = "MIT"}
+license-files = ["LICENSE"]
 authors = [
     {name = "Jeremy Cochoy"},
 ]
 keywords = ["options", "volatility", "ssvi", "implied-volatility", "finance"]
 urls = {Homepage = "https://github.com/jeremycochoy/ssvi_surface"}
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Financial and Insurance Industry",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
