@@ -36,6 +36,12 @@ class SSVIModel:
         if self.theta_t is None or self.T_fitted is None:
             raise ValueError("Model not fitted yet")
         T = np.asarray(T)
+        
+        # Handle case when there's only a single t value
+        if len(self.T_fitted) == 1:
+            # Return the single theta_t value for any input T
+            return np.full_like(T, self.theta_t[0], dtype=self.theta_t.dtype)
+        
         interp_func = interp1d(self.T_fitted, self.theta_t, kind=self.temporal_interp_method, 
                               bounds_error=False, fill_value='extrapolate')
         return interp_func(T)
@@ -59,29 +65,19 @@ class SSVIModel:
         return (theta_t / 2) * (1 + rho * phi_k + sqrt_term)
     
     def _fill_spreads(self, k: np.ndarray, bids: np.ndarray, asks: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Fill missing bids/asks with mid prices for spread calculation."""
+        """Fill missing bids/asks for spread calculation."""
         bids_filled = bids.copy()
         asks_filled = asks.copy()
         
-        both_valid = ~(np.isnan(bids) | np.isnan(asks))
-        if not np.any(both_valid):
-            return bids_filled, asks_filled
+        # Fill NaN bids with minimum of all bid values
+        valid_bids = bids[~np.isnan(bids)]
+        if len(valid_bids) > 0:
+            bids_filled[np.isnan(bids_filled)] = np.min(valid_bids)
         
-        mids = np.where(both_valid, (bids + asks) / 2.0, np.nan)
-        atm_idx = np.where(both_valid)[0][np.argmin(np.abs(k[both_valid]))]
-        k_atm = k[atm_idx]
-        
-        for i in range(len(k)):
-            if np.isnan(bids[i]) or np.isnan(asks[i]):
-                k_min, k_max = min(k_atm, k[i]), max(k_atm, k[i])
-                valid_mids = mids[(k >= k_min) & (k <= k_max) & both_valid]
-                valid_mids = valid_mids[~np.isnan(valid_mids)]
-                
-                if len(valid_mids) > 0:
-                    if np.isnan(bids[i]):
-                        bids_filled[i] = np.min(valid_mids)
-                    if np.isnan(asks[i]):
-                        asks_filled[i] = np.max(valid_mids)
+        # Fill NaN asks with maximum of all ask values
+        valid_asks = asks[~np.isnan(asks)]
+        if len(valid_asks) > 0:
+            asks_filled[np.isnan(asks_filled)] = np.max(valid_asks)
         
         return bids_filled, asks_filled
     

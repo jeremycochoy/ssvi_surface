@@ -80,6 +80,30 @@ class TestThetaInterpolation(unittest.TestCase):
         T_after = 2.0
         theta_after = self.model.theta_interp(T_after)
         self.assertTrue(np.isfinite(theta_after))
+    
+    def test_single_t_value(self):
+        """Property: Should work correctly when there's only a single t value."""
+        model = SSVIModel()
+        model.T_fitted = np.array([0.5])
+        model.theta_t = np.array([0.02])
+        
+        # Test scalar input
+        T_scalar = 0.3
+        theta_scalar = model.theta_interp(T_scalar)
+        self.assertEqual(theta_scalar.shape, ())
+        npt.assert_allclose(theta_scalar, 0.02, rtol=1e-10, atol=1e-10)
+        
+        # Test array input
+        T_array = np.array([0.1, 0.5, 1.0])
+        theta_array = model.theta_interp(T_array)
+        self.assertEqual(theta_array.shape, (3,))
+        npt.assert_allclose(theta_array, 0.02, rtol=1e-10, atol=1e-10)
+        
+        # Test that it returns the same value regardless of input T
+        T_various = np.array([0.01, 0.25, 0.75, 2.0])
+        theta_various = model.theta_interp(T_various)
+        self.assertTrue(np.allclose(theta_various, 0.02), 
+                       "All interpolated values should equal the single theta_t value")
 
 
 if __name__ == '__main__':

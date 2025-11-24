@@ -22,7 +22,7 @@ class TestHelperMethods(unittest.TestCase):
         npt.assert_array_equal(asks_filled, asks)
         
     def test_fill_spreads_missing_bids(self):
-        """Test with missing bids (should fill from mid prices)."""
+        """Test with missing bids (should fill with minimum bid value)."""
         k = np.array([-0.1, 0.0, 0.1])
         bids = np.array([np.nan, 0.7, np.nan])
         asks = np.array([0.7, 0.8, 0.9])
@@ -41,8 +41,11 @@ class TestHelperMethods(unittest.TestCase):
         self.assertFalse(np.isnan(bids_filled[0]), "Missing bid should be filled")
         self.assertFalse(np.isnan(bids_filled[2]), "Missing bid should be filled")
         
+        self.assertFalse(np.any(np.isnan(bids_filled)))
+        self.assertFalse(np.any(np.isnan(asks_filled)))
+        
     def test_fill_spreads_missing_asks(self):
-        """Test with missing asks (should fill from mid prices)."""
+        """Test with missing asks (should fill with maximum ask value)."""
         k = np.array([-0.1, 0.0, 0.1])
         bids = np.array([0.5, 0.6, 0.7])
         asks = np.array([np.nan, 0.7, np.nan])
@@ -60,6 +63,9 @@ class TestHelperMethods(unittest.TestCase):
         # Since there's a valid pair at index 1, they should be filled
         self.assertFalse(np.isnan(asks_filled[0]), "Missing ask should be filled")
         self.assertFalse(np.isnan(asks_filled[2]), "Missing ask should be filled")
+        
+        self.assertFalse(np.any(np.isnan(asks_filled)))
+        self.assertFalse(np.any(np.isnan(bids_filled)))
             
     def test_compute_bid_residuals(self):
         """Test _compute_bid_residuals with valid data."""
@@ -104,6 +110,17 @@ class TestHelperMethods(unittest.TestCase):
         # Should only return valid entries
         self.assertEqual(len(residuals), 2)  # Only first and third are valid
         self.assertEqual(len(weights), 2)
+    
+    def test_fill_spreads_mixed_missing(self):
+        """Test with mixed missing bids and asks."""
+        k = np.array([-0.2, -0.1, 0.0, 0.1, 0.2])
+        bids = np.array([0.5, np.nan, 0.7, np.nan, 0.9])
+        asks = np.array([np.nan, 0.7, 0.8, np.nan, 1.0])
+        
+        bids_filled, asks_filled = self.model._fill_spreads(k, bids, asks)
+        
+        self.assertFalse(np.any(np.isnan(bids_filled)))
+        self.assertFalse(np.any(np.isnan(asks_filled)))
 
 
 if __name__ == '__main__':
