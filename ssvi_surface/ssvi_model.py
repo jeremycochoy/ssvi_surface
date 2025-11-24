@@ -40,7 +40,7 @@ def _invert_bs_implied_vol(S: float, K: float, T: float, price: float, r: float,
 
 
 class SSVIModel:
-    def __init__(self, lr: float = 1e-3, outside_spread_penalty: float = 0.0, maturity_weight_exponent: float = 1.0, temporal_interp_method: str = 'linear') -> None:
+    def __init__(self, lr: float = 1e-3, outside_spread_penalty: float = 0.0, volatility_penalty: float = 0.0, maturity_weight_exponent: float = 1.0, temporal_interp_method: str = 'linear') -> None:
         self.rho: Optional[float] = None
         self.eta: Optional[float] = None
         self.gamma: Optional[float] = None
@@ -48,8 +48,12 @@ class SSVIModel:
         self.T_fitted: Optional[np.ndarray] = None
         self.lr = lr
         self.outside_spread_penalty = outside_spread_penalty
+        self.volatility_penalty = volatility_penalty
         self.maturity_weight_exponent = maturity_weight_exponent
         self.temporal_interp_method = temporal_interp_method
+        # Cached implied volatilities computed once during fit
+        self._cached_iv_bids_list: Optional[List[np.ndarray]] = None
+        self._cached_iv_asks_list: Optional[List[np.ndarray]] = None
     
     def theta_interp(self, T: Union[float, np.ndarray]) -> np.ndarray:
         """Interpolation of θ_t for arbitrary T."""
@@ -112,6 +116,54 @@ class SSVIModel:
     
         return residuals, weights
     
+    def _compute_implied_vols(self, prices: np.ndarray, strikes: np.ndarray, T: float, S0: float, r: float, q: float, option_types: np.ndarray) -> np.ndarray:
+        """Compute implied volatilities from option prices."""
+        ivs = np.full(len(prices), np.nan)
+        for i in range(len(prices)):
+            if not np.isnan(prices[i]):
+                try:
+                    ivs[i] = _invert_bs_implied_vol(S0, strikes[i], T, prices[i], r, q, option_types[i] == 'call')
+                except:
+                    ivs[i] = np.nan
+        return ivs
+
+    def _precompute_implied_vols(self, T_array: np.ndarray, strikes_list: List[np.ndarray], bids_list: List[np.ndarray], asks_list: List[np.ndarray], option_types_list: List[np.ndarray], S0: float, r: float, q: float) -> None:
+        """Pre-compute all implied volatilities once before optimization.
+
+        This method computes inverse IVs for all bid and ask prices across all maturities
+        and caches them to avoid repeated expensive computations during optimization.
+        """
+        self._cached_iv_bids_list = []
+        self._cached_iv_asks_list = []
+
+        for T, strikes, bids, asks, option_types in zip(T_array, strikes_list, bids_list, asks_list, option_types_list):
+            iv_bids = self._compute_implied_vols(bids, strikes, T, S0, r, q, option_types)
+            iv_asks = self._compute_implied_vols(asks, strikes, T, S0, r, q, option_types)
+            self._cached_iv_bids_list.append(iv_bids)
+            self._cached_iv_asks_list.append(iv_asks)
+    
+    def _compute_volatility_spread_coefficient(self, iv_bids: np.ndarray, iv_asks: np.ndarray) -> np.ndarray:
+        """Compute volatility spread coefficient.
+        
+        When both bid and ask implied vols are available: distance between them.
+        When one is missing: distance between 0 and max of all implied vols.
+        """
+        both_valid = ~np.isnan(iv_bids) & ~np.isnan(iv_asks)
+        one_valid = (~np.isnan(iv_bids)) | (~np.isnan(iv_asks))
+        
+        spreads = np.full(len(iv_bids), np.nan)
+        
+        if np.any(both_valid):
+            spreads[both_valid] = np.abs(iv_asks[both_valid] - iv_bids[both_valid])
+        
+        if np.any(one_valid & ~both_valid):
+            all_ivs = np.concatenate([iv_bids[~np.isnan(iv_bids)], iv_asks[~np.isnan(iv_asks)]])
+            if len(all_ivs) > 0:
+                max_iv = np.max(all_ivs)
+                spreads[one_valid & ~both_valid] = max_iv
+        
+        return spreads
+    
     def objective(self, params: np.ndarray, T_array: np.ndarray, strikes_list: List[np.ndarray], bids_list: List[np.ndarray], asks_list: List[np.ndarray], option_types_list: List[np.ndarray], S0: float, r: Optional[float], q: Optional[float]) -> float:
         """Weighted least squares: params = [rho, eta, gamma, theta_t0, theta_t1, ..., r?, q?]."""
         rho, eta, gamma = params[0], params[1], params[2]
@@ -143,6 +195,35 @@ class SSVIModel:
             ask_penalty = np.sum(np.maximum(0, ask_residuals) * ask_weights) / np.sum(ask_weights)
             
             loss = bid_loss + ask_loss + self.outside_spread_penalty * (bid_penalty + ask_penalty)
+
+            if self.volatility_penalty > 0:
+                # Use cached implied volatilities instead of recomputing
+                if self._cached_iv_bids_list is not None and self._cached_iv_asks_list is not None:
+                    iv_bids = self._cached_iv_bids_list[idx]
+                    iv_asks = self._cached_iv_asks_list[idx]
+                else:
+                    # Fallback to computing if cache not available (shouldn't happen during optimization)
+                    iv_bids = self._compute_implied_vols(bids, strikes, T, S0, r_val, q_val, option_types)
+                    iv_asks = self._compute_implied_vols(asks, strikes, T, S0, r_val, q_val, option_types)
+                vol_spreads = self._compute_volatility_spread_coefficient(iv_bids, iv_asks)
+                
+                bid_iv_valid = ~np.isnan(iv_bids) & ~np.isnan(vol_spreads) & ~np.isnan(iv_model) & (vol_spreads > 1e-8)
+                ask_iv_valid = ~np.isnan(iv_asks) & ~np.isnan(vol_spreads) & ~np.isnan(iv_model) & (vol_spreads > 1e-8)
+                
+                vol_penalty = 0.0
+                if np.any(bid_iv_valid):
+                    vol_weights_bid = 1.0 / vol_spreads[bid_iv_valid]
+                    vol_residuals_bid = np.abs(iv_model[bid_iv_valid] - iv_bids[bid_iv_valid])
+                    vol_penalty += np.sum(vol_residuals_bid * vol_weights_bid) / np.sum(vol_weights_bid)
+                
+                if np.any(ask_iv_valid):
+                    vol_weights_ask = 1.0 / vol_spreads[ask_iv_valid]
+                    vol_residuals_ask = np.abs(iv_model[ask_iv_valid] - iv_asks[ask_iv_valid])
+                    vol_penalty += np.sum(vol_residuals_ask * vol_weights_ask) / np.sum(vol_weights_ask)
+                
+
+                print(f"DEBUG vol_penalty: {self.volatility_penalty * vol_penalty}")
+                loss += self.volatility_penalty * vol_penalty
             weight = T ** self.maturity_weight_exponent
             total_weighted_loss += self.lr * loss * weight
             sum_weights += weight
@@ -456,7 +537,13 @@ class SSVIModel:
         asks_list = [asks_list[i] for i in sort_idx]
         option_types_list = [option_types_list[i] for i in sort_idx]
         n_maturities = len(T_array)
-        
+
+        # Pre-compute inverse IVs once before optimization (only if volatility_penalty > 0)
+        if self.volatility_penalty > 0:
+            r_for_iv = r if r is not None else 0.045
+            q_for_iv = q if q is not None else 0.0
+            self._precompute_implied_vols(T_array, strikes_list, bids_list, asks_list, option_types_list, S0, r_for_iv, q_for_iv)
+
         if initial_params is None:
             initial_params = self._estimate_initial_params(T_array, strikes_list, bids_list, asks_list, option_types_list, S0, r, q)
         else:
