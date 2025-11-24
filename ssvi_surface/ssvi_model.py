@@ -1,6 +1,6 @@
 from scipy.optimize import minimize
 from scipy.stats import norm
-from scipy.optimize import OptimizeResult
+from scipy.optimize import OptimizeResult, brentq
 from scipy.interpolate import interp1d
 from typing import List, Optional, Tuple, Union
 import numpy as np
@@ -17,6 +17,26 @@ def forward_bs_price(S: Union[float, np.ndarray], K: Union[float, np.ndarray], T
     call_price = np.exp(-r * T) * (F_T * norm.cdf(d1) - K * norm.cdf(d2))
     put_price = np.exp(-r * T) * (K * norm.cdf(-d2) - F_T * norm.cdf(-d1))
     return np.where(is_call, call_price, put_price)
+
+
+def _invert_bs_implied_vol(S: float, K: float, T: float, price: float, r: float, q: float, is_call: bool, iv_min: float = 1e-6, iv_max: float = 5.0) -> float:
+    """Invert Black-Scholes to get implied volatility from option price.
+    
+    Uses Brent's method to solve for σ such that BS(S, K, T, σ, r, q, is_call) = price.
+    """
+    def price_diff(iv):
+        result = forward_bs_price(S, K, T, iv, r, q, is_call)
+        # Ensure scalar result
+        if isinstance(result, np.ndarray):
+            return float(result.item()) - price
+        return float(result) - price
+    
+    try:
+        iv = brentq(price_diff, iv_min, iv_max, xtol=1e-6)
+        return float(iv)
+    except ValueError:
+        # Fallback: return a reasonable default if inversion fails
+        return 0.2
 
 
 class SSVIModel:
@@ -64,23 +84,14 @@ class SSVIModel:
         sqrt_term = np.sqrt((phi_k + rho)**2 + 1 - rho**2)
         return (theta_t / 2) * (1 + rho * phi_k + sqrt_term)
     
-    def _fill_spreads(self, k: np.ndarray, bids: np.ndarray, asks: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Fill missing bids/asks for spread calculation."""
-        bids_filled = bids.copy()
-        asks_filled = asks.copy()
-        
-        # Fill NaN bids with minimum of all bid values
-        valid_bids = bids[~np.isnan(bids)]
-        if len(valid_bids) > 0:
-            bids_filled[np.isnan(bids_filled)] = np.min(valid_bids)
-        
-        # Fill NaN asks with maximum of all ask values
-        valid_asks = asks[~np.isnan(asks)]
-        if len(valid_asks) > 0:
-            asks_filled[np.isnan(asks_filled)] = np.max(valid_asks)
-        
-        return bids_filled, asks_filled
-    
+    def _compute_spreads(self, bids: np.ndarray, asks: np.ndarray) -> np.ndarray:
+        """Compute spreads and fill NaN values with maximum spread."""
+        spreads = asks - bids
+        max_spread = np.nanmax(spreads)
+        if not np.isnan(max_spread):
+            spreads = np.where(np.isnan(spreads), max_spread, spreads)
+        return spreads
+
     def _compute_bid_residuals(self, bids: np.ndarray, model_prices: np.ndarray, spreads: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         valid = ~np.isnan(bids) & ~np.isnan(spreads)
         if not np.any(valid):
@@ -117,9 +128,8 @@ class SSVIModel:
             
             F_T = S0 * np.exp((r_val - q_val) * T)
             k = np.log(strikes / F_T)
-            bid_filled, ask_filled = self._fill_spreads(k, bids, asks)
-            spreads = ask_filled - bid_filled
-            
+            spreads = self._compute_spreads(bids, asks)
+
             w_model = self.ssvi(k, rho, eta, gamma, theta_t[idx])
             iv_model = np.sqrt(np.maximum(w_model / T, 1e-8))
             model_prices = forward_bs_price(S0, strikes, T, iv_model, r_val, q_val, option_types == 'call')
@@ -139,24 +149,296 @@ class SSVIModel:
         
         return total_weighted_loss / sum_weights if sum_weights > 0 else 0.0
     
-    def _estimate_initial_params(self, T_array: np.ndarray, strikes_list: List[np.ndarray], bids_list: List[np.ndarray], asks_list: List[np.ndarray], option_types_list: List[np.ndarray], S0: float, r: Optional[float], q: Optional[float]) -> np.ndarray:
-        """Estimate initial parameters: [rho, eta, gamma] + theta_t per maturity + r?, q?."""
-        r_init = r if r is not None else 0.025
-        q_init = q if q is not None else 0.0
-        theta_t_init = []
-        for T, strikes, bids, asks in zip(T_array, strikes_list, bids_list, asks_list):
-            F_T = S0 * np.exp((r_init - q_init) * T)
-            k = np.log(strikes / F_T)
-            both_valid = ~(np.isnan(bids) | np.isnan(asks))
-            
-            if np.any(both_valid):
-                atm_idx = np.where(both_valid)[0][np.argmin(np.abs(k[both_valid]))]
-                mid_price = (bids[atm_idx] + asks[atm_idx]) / 2.0
-                theta_t_init.append(0.64 * T if mid_price >= 1e-6 else 0.1 * T)
-            else:
-                theta_t_init.append(0.1 * T)
+    def _compute_theta_t_from_atm(self, T: float, strikes: np.ndarray, bids: np.ndarray, asks: np.ndarray, option_types: np.ndarray, S0: float, r: float, q: float) -> float:
+        """Step 1 - Slice-wise ATM quantities.
         
-        base_params = np.concatenate([[-0.3, 1.0, 0.5], theta_t_init])
+        Mathematical model:
+        For maturity t:
+        1. Compute the forward F_t = S0 * exp((r-q)*t)
+        2. Take the option with strike closest to F_t and invert BS to get ATM vol σ_ATM(t)
+        3. Set θ_t = σ_ATM(t)^2 * t (with t in years)
+        
+        Returns:
+            theta_t: The θ value for this maturity slice, or NaN if computation fails
+        """
+        F_t = S0 * np.exp((r - q) * T)
+        
+        # Find valid bid/ask pairs
+        both_valid = ~(np.isnan(bids) | np.isnan(asks))
+        if not np.any(both_valid):
+            return np.nan
+        
+        # Find strike closest to forward (ATM)
+        valid_strikes = strikes[both_valid]
+        valid_bids = bids[both_valid]
+        valid_asks = asks[both_valid]
+        valid_option_types = option_types[both_valid]
+        
+        k_valid = np.log(valid_strikes / F_t)
+        atm_idx = np.argmin(np.abs(k_valid))
+        
+        # Get mid price for ATM option
+        mid_price = (valid_bids[atm_idx] + valid_asks[atm_idx]) / 2.0
+        
+        # Invert BS to get implied volatility
+        is_call = (valid_option_types[atm_idx] == 'call')
+        try:
+            sigma_atm = _invert_bs_implied_vol(S0, valid_strikes[atm_idx], T, mid_price, r, q, is_call)
+        except:
+            return np.nan
+        
+        # θ_t = σ_ATM(t)^2 * t
+        theta_t = sigma_atm ** 2 * T
+        
+        return max(theta_t, 1e-5)  # Ensure positive
+    
+    def _compute_atm_derivatives(self, T: float, strikes: np.ndarray, bids: np.ndarray, asks: np.ndarray, option_types: np.ndarray, S0: float, r: float, q: float, F_t: float) -> Tuple[float, float]:
+        """Step 2 - Estimate ATM skew and curvature.
+        
+        Mathematical model:
+        On the same slice:
+        1. Work with log-moneyness k = log(K/F_t)
+        2. For strikes around ATM (one OTM put, one OTM call), compute total variance
+           w(k) = σ(k)^2 * t from the BS-implied vols
+        3. Approximate first and second derivatives at ATM:
+           - Choose two small symmetric points k_- < 0 < k_+
+           - w'(0) ≈ (w(k_+) - w(k_-)) / (k_+ - k_-)
+           - w''(0) ≈ (w(k_+) - 2w(0) + w(k_-)) / ((k_+ - k_-)/2)^2
+        
+        Returns:
+            w_prime_0: First derivative w'(0) (skew), or NaN if computation fails
+            w_double_prime_0: Second derivative w''(0) (curvature), or NaN if computation fails
+        """
+        # Find valid bid/ask pairs
+        both_valid = ~(np.isnan(bids) | np.isnan(asks))
+        if not np.any(both_valid):
+            return np.nan, np.nan
+        
+        # Get valid data
+        valid_strikes = strikes[both_valid]
+        valid_bids = bids[both_valid]
+        valid_asks = asks[both_valid]
+        valid_option_types = option_types[both_valid]
+        
+        # Compute log-moneyness
+        k_valid = np.log(valid_strikes / F_t)
+        
+        # Find ATM index (closest to k=0, true ATM)
+        atm_idx = np.argmin(np.abs(k_valid))
+        k_atm = k_valid[atm_idx]
+        
+        # Find symmetric points around k=0 (true ATM)
+        # Look for OTM put (k < 0) and OTM call (k > 0)
+        k_neg = k_valid[k_valid < 0]
+        k_pos = k_valid[k_valid > 0]
+        
+        if len(k_neg) == 0 or len(k_pos) == 0:
+            # Fallback: use points around the closest-to-ATM strike
+            k_neg = k_valid[k_valid < k_atm]
+            k_pos = k_valid[k_valid > k_atm]
+            if len(k_neg) == 0 or len(k_pos) == 0:
+                return np.nan, np.nan
+        
+        # Choose points closest to k=0 but on opposite sides
+        k_minus = k_neg[np.argmax(k_neg)]  # Closest negative to 0 (largest negative)
+        k_plus = k_pos[np.argmin(k_pos)]   # Closest positive to 0 (smallest positive)
+        
+        # Get indices in original valid arrays
+        idx_minus = np.where(k_valid == k_minus)[0][0]
+        idx_plus = np.where(k_valid == k_plus)[0][0]
+        
+        # Compute total variance w(k) = σ(k)^2 * T for each point
+        def compute_w(k_idx):
+            mid_price = (valid_bids[k_idx] + valid_asks[k_idx]) / 2.0
+            is_call = (valid_option_types[k_idx] == 'call')
+            try:
+                sigma = _invert_bs_implied_vol(S0, valid_strikes[k_idx], T, mid_price, r, q, is_call)
+                return sigma ** 2 * T
+            except:
+                return np.nan
+        
+        w_minus = compute_w(idx_minus)
+        w_atm = compute_w(atm_idx)
+        w_plus = compute_w(idx_plus)
+        
+        # Check for NaN values
+        if np.isnan(w_minus) or np.isnan(w_atm) or np.isnan(w_plus):
+            return np.nan, np.nan
+        
+        # Approximate derivatives
+        # w'(0) ≈ (w(k_+) - w(k_-)) / (k_+ - k_-)
+        w_prime_0 = (w_plus - w_minus) / (k_plus - k_minus)
+        
+        # w''(0) ≈ (w(k_+) - 2w(0) + w(k_-)) / ((k_+ - k_-)/2)^2
+        delta_k = (k_plus - k_minus) / 2.0
+        if abs(delta_k) < 1e-8:
+            return np.nan, np.nan
+        else:
+            w_double_prime_0 = (w_plus - 2 * w_atm + w_minus) / (delta_k ** 2)
+        
+        return w_prime_0, max(w_double_prime_0, 1e-6)  # Ensure positive curvature
+    
+    def _compute_per_maturity_rho_phi(self, theta_t: float, w_prime_0: float, w_double_prime_0: float, epsilon: float = 1e-6) -> Tuple[float, float]:
+        """Step 3 - Back-out per-maturity ρ_t and φ_t.
+        
+        Mathematical model:
+        For SSVI:
+        w(k,t) = (θ_t/2)[1 + ρ*φ(θ_t)*k + sqrt((φ(θ_t)*k + ρ)^2 + 1 - ρ^2)]
+        
+        Exact relationships at ATM:
+        w'(0,t) = θ_t * φ(θ_t) * ρ
+        w''(0,t) = (1/2) * θ_t * φ(θ_t)^2 * (1 - ρ^2)
+        
+        Solving:
+        1. φ_t^2 = (2/θ_t) * (s_2 + s_1^2/(2*θ_t))
+           where s_1 = w'(0), s_2 = w''(0)
+        2. φ_t = sqrt(max(φ_t^2, ε))
+        3. ρ_t = s_1 / (θ_t * φ_t)
+           Clip ρ_t into (-0.999, 0.999)
+        
+        Returns:
+            rho_t: Per-maturity correlation parameter, or NaN if inputs are invalid
+            phi_t: Per-maturity φ parameter, or NaN if inputs are invalid
+        """
+        # Check for NaN inputs
+        if np.isnan(theta_t) or np.isnan(w_prime_0) or np.isnan(w_double_prime_0) or theta_t <= 0:
+            return np.nan, np.nan
+        
+        s_1 = w_prime_0
+        s_2 = w_double_prime_0
+        
+        # φ_t^2 = (2/θ_t) * (s_2 + s_1^2/(2*θ_t))
+        phi_t_squared = (2.0 / theta_t) * (s_2 + (s_1 ** 2) / (2.0 * theta_t))
+        phi_t = np.sqrt(max(phi_t_squared, epsilon))
+        
+        # ρ_t = s_1 / (θ_t * φ_t)
+        if abs(theta_t * phi_t) < 1e-10:
+            rho_t = 0.0
+        else:
+            rho_t = s_1 / (theta_t * phi_t)
+
+        return rho_t, phi_t
+    
+    def _compute_global_eta_gamma(self, theta_t_array: np.ndarray, phi_t_array: np.ndarray) -> Tuple[float, float]:
+        """Step 3 - Compute global η and γ from canonical SSVI power law.
+        
+        Mathematical model:
+        Impose canonical SSVI power law: φ(θ) = η * θ^(-γ)
+        
+        Fit linear regression:
+        log(φ_t) ≈ log(η) - γ * log(θ_t)
+        
+        across maturities to get initial (η_0, γ_0).
+        
+        Returns:
+            eta: Global η parameter, or NaN if computation fails
+            gamma: Global γ parameter, or NaN if computation fails
+        """
+        # Filter out invalid values (NaN, zero, negative)
+        valid_mask = (~np.isnan(theta_t_array)) & (~np.isnan(phi_t_array)) & (theta_t_array > 0) & (phi_t_array > 0)
+        if not np.any(valid_mask):
+            return np.nan, np.nan
+        
+        theta_valid = theta_t_array[valid_mask]
+        phi_valid = phi_t_array[valid_mask]
+        
+        if len(theta_valid) < 2:
+            return np.nan, np.nan  # Need at least 2 points for regression
+        
+        # Linear regression: log(φ_t) = log(η) - γ * log(θ_t)
+        # y = log(φ_t), x = log(θ_t)
+        # y = a + b*x, where a = log(η), b = -γ
+        log_theta = np.log(theta_valid)
+        log_phi = np.log(phi_valid)
+        
+        # Simple linear regression
+        x_mean = np.mean(log_theta)
+        y_mean = np.mean(log_phi)
+        
+        numerator = np.sum((log_theta - x_mean) * (log_phi - y_mean))
+        denominator = np.sum((log_theta - x_mean) ** 2)
+        
+        if abs(denominator) < 1e-10:
+            return np.nan, np.nan
+        
+        b = numerator / denominator  # b = -γ
+        a = y_mean - b * x_mean      # a = log(η)
+        
+        gamma = -b
+        eta = np.exp(a)
+
+        return eta, gamma
+    
+    def _estimate_initial_params(self, T_array: np.ndarray, strikes_list: List[np.ndarray], bids_list: List[np.ndarray], asks_list: List[np.ndarray], option_types_list: List[np.ndarray], S0: float, r: Optional[float], q: Optional[float]) -> np.ndarray:
+        """Estimate initial parameters using data-driven approach.
+        
+        Coordinates the three-step mathematical model:
+        Step 1: Compute θ_t from ATM vols for each maturity
+        Step 2: Estimate ATM skew and curvature (w'(0) and w''(0))
+        Step 3: Back-out per-maturity ρ_t and φ_t, then global η and γ
+        
+        Returns:
+            Initial parameter array: [rho, eta, gamma] + theta_t per maturity + r?, q?
+        """
+        r_init = r if r is not None else 0.045
+        q_init = q if q is not None else 0.0
+        
+        # Step 1: Compute θ_t for each maturity
+        theta_t_array = []
+        rho_t_array = []
+        phi_t_array = []
+        
+        for T, strikes, bids, asks, option_types in zip(T_array, strikes_list, bids_list, asks_list, option_types_list):
+            # Step 1: Compute θ_t from ATM vol
+            theta_t = self._compute_theta_t_from_atm(T, strikes, bids, asks, option_types, S0, r_init, q_init)
+            theta_t_array.append(theta_t)
+            
+            # Step 2: Compute ATM derivatives
+            F_t = S0 * np.exp((r_init - q_init) * T)
+            w_prime_0, w_double_prime_0 = self._compute_atm_derivatives(
+                T, strikes, bids, asks, option_types, S0, r_init, q_init, F_t
+            )
+            
+            # Step 3: Compute per-maturity ρ_t and φ_t
+            rho_t, phi_t = self._compute_per_maturity_rho_phi(theta_t, w_prime_0, w_double_prime_0)
+            rho_t_array.append(rho_t)
+            phi_t_array.append(phi_t)
+        
+        theta_t_array = np.array(theta_t_array)
+        rho_t_array = np.array(rho_t_array)
+        phi_t_array = np.array(phi_t_array)
+        
+        # Fill NaN values in theta_t_array: forward fill then backward fill
+        theta_t_filled = theta_t_array.copy()
+        # Forward fill
+        for i in range(1, len(theta_t_filled)):
+            if np.isnan(theta_t_filled[i]) and not np.isnan(theta_t_filled[i-1]):
+                theta_t_filled[i] = theta_t_filled[i-1]
+        # Backward fill
+        for i in range(len(theta_t_filled) - 2, -1, -1):
+            if np.isnan(theta_t_filled[i]) and not np.isnan(theta_t_filled[i+1]):
+                theta_t_filled[i] = theta_t_filled[i+1]
+        # If still NaN values remain, use default (0.1 * T for each maturity)
+        for i in range(len(theta_t_filled)):
+            if np.isnan(theta_t_filled[i]):
+                theta_t_filled[i] = 0.1 * T_array[i]
+        
+        # Step 3: Compute global η and γ from regression (ignoring NaNs)
+        eta_init, gamma_init = self._compute_global_eta_gamma(theta_t_array, phi_t_array)
+        
+        # For canonical SSVI (constant ρ), take median of per-maturity ρ_t (ignoring NaNs)
+        rho_init = np.nanmedian(rho_t_array) if len(rho_t_array) > 0 else np.nan
+        
+        # Use defaults only at the very end if final parameters are NaN
+        if np.isnan(rho_init):
+            rho_init = 0.0
+        if np.isnan(eta_init):
+            eta_init = 1.0
+        if np.isnan(gamma_init):
+            gamma_init = 0.5
+        
+        # Build parameter array
+        base_params = np.concatenate([[rho_init, eta_init, gamma_init], theta_t_filled])
         extra_params = []
         if r is None:
             extra_params.append(r_init)
