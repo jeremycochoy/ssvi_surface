@@ -130,6 +130,9 @@ class SSVIModel:
             k = np.log(strikes / F_T)
             spreads = self._compute_spreads(bids, asks)
 
+            if np.all(np.isnan(spreads)):
+                continue
+
             w_model = self.ssvi(k, rho, eta, gamma, theta_t[idx])
             iv_model = np.sqrt(np.maximum(w_model / T, 1e-8))
             model_prices = forward_bs_price(S0, strikes, T, iv_model, r_val, q_val, option_types == 'call')
